@@ -4,6 +4,7 @@
 from pydantic import BaseModel, Field, EmailStr
 from typing import Optional, Dict, Any
 from .common import BaseSchema
+from .user import UserResponse
 
 
 class DeviceInfo(BaseModel):
@@ -17,7 +18,7 @@ class DeviceInfo(BaseModel):
 class SocialLoginRequest(BaseModel):
     """소셜 로그인 요청"""
     access_token: str = Field(..., description="소셜 플랫폼 액세스 토큰")
-    device_info: DeviceInfo
+    device_info: Optional[DeviceInfo] = Field(None, description="디바이스 정보")
 
 
 class KakaoLoginRequest(SocialLoginRequest):
@@ -35,12 +36,27 @@ class GoogleLoginRequest(SocialLoginRequest):
     pass
 
 
+class Token(BaseModel):
+    """JWT 토큰"""
+    access_token: str = Field(..., description="액세스 토큰")
+    refresh_token: str = Field(..., description="리프레시 토큰")
+    token_type: str = Field(default="bearer", description="토큰 타입")
+
+
 class TokenResponse(BaseSchema):
     """토큰 응답"""
     access_token: str = Field(..., description="액세스 토큰")
     refresh_token: str = Field(..., description="리프레시 토큰")
     token_type: str = Field(default="bearer", description="토큰 타입")
     expires_in: int = Field(..., description="만료 시간 (초)")
+
+
+class AuthResponse(BaseModel):
+    """인증 응답"""
+    access_token: str = Field(..., description="액세스 토큰")
+    refresh_token: str = Field(..., description="리프레시 토큰")
+    token_type: str = Field(default="bearer", description="토큰 타입")
+    user: UserResponse = Field(..., description="사용자 정보")
 
 
 class UserBasicInfo(BaseSchema):
