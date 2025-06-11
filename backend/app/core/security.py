@@ -3,7 +3,7 @@
 JWT 토큰, 비밀번호 해싱 등
 """
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Union
+from typing import Optional, Union, Dict, Any
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from .config import settings
@@ -18,31 +18,32 @@ ALGORITHM = "HS256"
 
 
 def create_access_token(
-    subject: Union[str, int], 
+    data: Dict[str, Any], 
     expires_delta: Optional[timedelta] = None
 ) -> str:
     """
     Access Token 생성
     
     Args:
-        subject: 토큰 주체 (사용자 ID)
+        data: 토큰에 포함할 데이터 ({"sub": user_id})
         expires_delta: 만료 시간 (기본값: 설정값 사용)
     
     Returns:
         JWT 토큰 문자열
     """
+    to_encode = data.copy()
+    
     if expires_delta:
         expire = datetime.now(timezone.utc) + expires_delta
     else:
         expire = datetime.now(timezone.utc) + timedelta(
-            minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES
+            hours=settings.ACCESS_TOKEN_EXPIRE_HOURS
         )
     
-    to_encode = {
+    to_encode.update({
         "exp": expire,
-        "sub": str(subject),
         "type": "access"
-    }
+    })
     
     encoded_jwt = jwt.encode(
         to_encode, 
@@ -52,25 +53,33 @@ def create_access_token(
     return encoded_jwt
 
 
-def create_refresh_token(subject: Union[str, int]) -> str:
+def create_refresh_token(
+    data: Dict[str, Any],
+    expires_delta: Optional[timedelta] = None
+) -> str:
     """
     Refresh Token 생성
     
     Args:
-        subject: 토큰 주체 (사용자 ID)
+        data: 토큰에 포함할 데이터 ({"sub": user_id})
+        expires_delta: 만료 시간 (기본값: 설정값 사용)
     
     Returns:
         JWT 토큰 문자열
     """
-    expire = datetime.now(timezone.utc) + timedelta(
-        days=settings.REFRESH_TOKEN_EXPIRE_DAYS
-    )
+    to_encode = data.copy()
     
-    to_encode = {
+    if expires_delta:
+        expire = datetime.now(timezone.utc) + expires_delta
+    else:
+        expire = datetime.now(timezone.utc) + timedelta(
+            days=settings.REFRESH_TOKEN_EXPIRE_DAYS
+        )
+    
+    to_encode.update({
         "exp": expire,
-        "sub": str(subject),
         "type": "refresh"
-    }
+    })
     
     encoded_jwt = jwt.encode(
         to_encode,
@@ -80,7 +89,7 @@ def create_refresh_token(subject: Union[str, int]) -> str:
     return encoded_jwt
 
 
-def verify_token(token: str, token_type: str = "access") -> Optional[str]:
+def verify_token(token: str, token_type: str = "access") -> Optional[Dict[str, Any]]:
     """
     JWT 토큰 검증
     
@@ -89,7 +98,7 @@ def verify_token(token: str, token_type: str = "access") -> Optional[str]:
         token_type: 토큰 타입 ("access" 또는 "refresh")
     
     Returns:
-        사용자 ID 또는 None
+        토큰 페이로드 또는 None
     """
     try:
         payload = jwt.decode(
@@ -102,11 +111,7 @@ def verify_token(token: str, token_type: str = "access") -> Optional[str]:
         if payload.get("type") != token_type:
             return None
             
-        user_id: str = payload.get("sub")
-        if user_id is None:
-            return None
-            
-        return user_id
+        return payload
         
     except JWTError:
         return None
@@ -153,7 +158,7 @@ def generate_random_string(length: int = 32) -> str:
     return ''.join(secrets.choice(alphabet) for _ in range(length))
 
 
-def create_token_pair(user_id: Union[str, int]) -> dict:
+def create_token_pair(user_id: Union[str, int]) -> Dict[str, Any]:
     """
     Access Token과 Refresh Token 쌍 생성
     
@@ -163,12 +168,14 @@ def create_token_pair(user_id: Union[str, int]) -> dict:
     Returns:
         토큰 쌍 딕셔너리
     """
-    access_token = create_access_token(subject=user_id)
-    refresh_token = create_refresh_token(subject=user_id)
+    data = {"sub": str(user_id)}
+    
+    access_token = create_access_token(data=data)
+    refresh_token = create_refresh_token(data=data)
     
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,
         "token_type": "bearer",
-        "expires_in": settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60
+        "expires_in": settings.ACCESS_TOKEN_EXPIRE_HOURS * 3600
     }
