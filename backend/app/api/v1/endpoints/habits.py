@@ -2,7 +2,7 @@
 습관 관련 API 엔드포인트
 """
 from typing import List, Optional
-from datetime import date
+from datetime import date, datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
@@ -24,6 +24,7 @@ from app.schemas.habit import (
     StandardResponse
 )
 from app.services.habit_service import HabitService
+from app.services.notification_service import NotificationService
 from app.models.user import User
 from app.models.habit import DifficultyLevel, FrequencyType
 
@@ -377,21 +378,174 @@ async def get_habit_statistics_summary(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(standard_rate_limit)
 ):
-    """습관 통계 요약 (추후 구현)"""
-    return {
-        "message": "통계 기능은 추후 구현 예정입니다",
-        "user_id": str(current_user.id)
-    }
+    """습관 통계 요약"""
+    habit_service = HabitService(db)
+    
+    try:
+        statistics = await habit_service.get_habit_statistics_summary(current_user.id)
+        return statistics
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"통계 조회 실패: {str(e)}"
+        )
 
 
-@router.get("/recommendations")
+@router.get("/recommendations", response_model=List[HabitTemplateResponse])
 async def get_habit_recommendations(
+    limit: int = Query(5, ge=1, le=10, description="추천할 습관 개수"),
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
     _: None = Depends(standard_rate_limit)
 ):
-    """개인화된 습관 추천 (추후 구현)"""
-    return {
-        "message": "추천 기능은 추후 구현 예정입니다",
-        "user_id": str(current_user.id)
-    }
+    """개인화된 습관 추천"""
+    habit_service = HabitService(db)
+    
+    try:
+        recommendations = await habit_service.recommend_habits_for_user(current_user, limit)
+        return [HabitTemplateResponse.model_validate(template) for template in recommendations]
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"습관 추천 실패: {str(e)}"
+        )
+
+
+@router.get("/coaching/{habit_id}")
+async def get_ai_coaching_message(
+    habit_id: UUID,
+    context: str = Query("general", regex=r"^(general|motivation|tip|reminder)$", description="메시지 컨텍스트"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(standard_rate_limit)
+):
+    """AI 코칭 메시지 조회"""
+    habit_service = HabitService(db)
+    
+    try:
+        # 사용자 습관 소유권 확인
+        user_habit = await habit_service.get_user_habit_by_id(current_user.id, habit_id)
+        if not user_habit:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="습관을 찾을 수 없습니다"
+            )
+        
+        message = await habit_service.get_ai_coaching_message(habit_id, context)
+        
+        return {
+            "habit_id": str(habit_id),
+            "context": context,
+            "message": message,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"AI 코칭 메시지 조회 실패: {str(e)}"
+        )
+
+
+# =====================================================================
+# 알림/리마인더 API
+# =====================================================================
+
+@router.post("/notifications/schedule-reminders")
+async def schedule_habit_reminders(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(standard_rate_limit)
+):
+    """사용자의 습관 리마인더 스케줄링"""
+    notification_service = NotificationService(db)
+    
+    try:
+        scheduled_reminders = await notification_service.schedule_habit_reminders(current_user.id)
+        
+        return {
+            "message": f"{len(scheduled_reminders)}개의 리마인더가 스케줄되었습니다",
+            "scheduled_count": len(scheduled_reminders),
+            "reminders": [
+                {
+                    "habit_name": reminder["habit_name"],
+                    "scheduled_time": reminder["scheduled_time"].isoformat(),
+                    "message": reminder["message"]
+                }
+                for reminder in scheduled_reminders
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"리마인더 스케줄링 실패: {str(e)}"
+        )
+
+
+@router.post("/notifications/send-motivation/{habit_id}")
+async def send_motivation_notification(
+    habit_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(standard_rate_limit)
+):
+    """특정 습관에 대한 동기부여 알림 발송"""
+    notification_service = NotificationService(db)
+    
+    try:
+        # 사용자 습관 소유권 확인
+        habit_service = HabitService(db)
+        user_habit = await habit_service.get_user_habit_by_id(current_user.id, habit_id)
+        if not user_habit:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="습관을 찾을 수 없습니다"
+            )
+        
+        success = await notification_service.send_motivation_message(current_user.id, habit_id)
+        
+        if success:
+            return {"message": "동기부여 알림이 발송되었습니다"}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="알림 발송에 실패했습니다"
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"동기부여 알림 발송 실패: {str(e)}"
+        )
+
+
+@router.post("/notifications/celebration")
+async def send_celebration_notification(
+    habit_name: str = Query(..., description="축하할 습관 이름"),
+    streak: int = Query(..., ge=1, description="연속 달성 일수"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    _: None = Depends(standard_rate_limit)
+):
+    """습관 완료 축하 알림 발송"""
+    notification_service = NotificationService(db)
+    
+    try:
+        success = await notification_service.send_habit_completion_celebration(
+            current_user.id, habit_name, streak
+        )
+        
+        if success:
+            return {"message": f"'{habit_name}' 습관 {streak}일 달성 축하 알림이 발송되었습니다"}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="축하 알림 발송에 실패했습니다"
+            )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"축하 알림 발송 실패: {str(e)}"
+        )

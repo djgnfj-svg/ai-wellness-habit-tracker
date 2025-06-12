@@ -16,11 +16,14 @@ from datetime import datetime, date, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update, delete, func, and_, or_, desc, asc
 from sqlalchemy.orm import selectinload, joinedload
+import random
+import logging
 
 from app.models.habit import (
     HabitCategory, HabitTemplate, UserHabit, HabitLog, HabitStreak,
     FrequencyType, CompletionStatus, DifficultyLevel
 )
+from app.models.user import User
 from app.schemas.habit import (
     HabitCategoryCreate, HabitCategoryUpdate,
     HabitTemplateCreate, HabitTemplateUpdate, HabitTemplateSearchParams,
@@ -30,6 +33,7 @@ from app.schemas.habit import (
 )
 from app.core.exceptions import NotFoundError, ValidationError, ConflictError
 
+logger = logging.getLogger(__name__)
 
 class HabitService:
     """
@@ -378,10 +382,13 @@ class HabitService:
         
         Args:
             user_id: 사용자 ID
-            log_data: 로그 데이터
+            log_data: 로그 생성 데이터
             
         Returns:
             HabitLog: 생성된 로그
+            
+        Raises:
+            NotFoundError: 습관을 찾을 수 없는 경우
         """
         # 사용자 습관 확인
         habit = await self.get_user_habit_by_id(user_id, log_data.user_habit_id)
@@ -403,6 +410,26 @@ class HabitService:
         # 습관 통계 업데이트
         if log_data.completion_status == CompletionStatus.COMPLETED:
             await self._update_habit_statistics(habit, log)
+            
+            # 자동 축하 알림 발송 (비동기)
+            try:
+                from app.services.notification_service import NotificationService
+                notification_service = NotificationService(self.db)
+                
+                # 새로운 스트릭 계산
+                new_streak = await self._calculate_streak(habit.id, log.logged_at.date())
+                habit_name = habit.custom_name or habit.habit_template.name
+                
+                # 축하 알림 발송 (백그라운드)
+                import asyncio
+                asyncio.create_task(
+                    notification_service.send_habit_completion_celebration(
+                        user_id, habit_name, new_streak
+                    )
+                )
+            except Exception as e:
+                # 알림 실패해도 로그 생성은 계속 진행
+                logger.warning(f"축하 알림 발송 실패: {str(e)}")
         
         await self.db.commit()
         await self.db.refresh(log)
@@ -644,3 +671,533 @@ class HabitService:
                 continue
         
         return None
+
+    # =================================================================
+    # 습관 추천 엔진
+    # =================================================================
+
+    async def recommend_habits_for_user(self, user: User, limit: int = 5) -> List[HabitTemplate]:
+        """
+        사용자 맞춤 습관 추천
+        
+        Args:
+            user: 사용자 객체
+            limit: 추천할 습관 개수
+            
+        Returns:
+            List[HabitTemplate]: 추천 습관 템플릿 목록
+        """
+        # 1. 이미 등록된 습관 템플릿 ID 수집
+        user_habits = await self.get_user_habits(user.id)
+        existing_template_ids = {habit.habit_template_id for habit in user_habits}
+        
+        # 2. 사용자 웰니스 프로필 기반 필터링
+        candidates = await self._get_recommendation_candidates(user, existing_template_ids)
+        
+        # 3. 추천 점수 계산 및 정렬
+        scored_habits = []
+        for template in candidates:
+            score = await self._calculate_recommendation_score(user, template, user_habits)
+            scored_habits.append((template, score))
+        
+        # 점수 순으로 정렬
+        scored_habits.sort(key=lambda x: x[1], reverse=True)
+        
+        # 4. 상위 추천 습관 반환 (다양성 고려)
+        recommendations = self._diversify_recommendations(scored_habits, limit)
+        
+        return recommendations
+
+    async def _get_recommendation_candidates(
+        self, 
+        user: User, 
+        existing_template_ids: set
+    ) -> List[HabitTemplate]:
+        """추천 후보 습관 템플릿 조회"""
+        stmt = select(HabitTemplate).options(
+            joinedload(HabitTemplate.category)
+        ).where(
+            and_(
+                HabitTemplate.is_active == True,
+                ~HabitTemplate.id.in_(existing_template_ids)
+            )
+        )
+        
+        result = await self.db.execute(stmt)
+        return result.scalars().all()
+
+    async def _calculate_recommendation_score(
+        self, 
+        user: User, 
+        template: HabitTemplate, 
+        user_habits: List[UserHabit]
+    ) -> float:
+        """
+        습관 추천 점수 계산
+        
+        점수 구성 요소:
+        - 사용자 목표 일치도 (30%)
+        - 난이도 적합성 (25%)
+        - 시간 가용성 (20%)
+        - 카테고리 균형 (15%)
+        - 인기도/추천도 (10%)
+        """
+        score = 0.0
+        
+        # 1. 사용자 목표 일치도 (30점)
+        goal_score = self._calculate_goal_alignment_score(user, template)
+        score += goal_score * 0.3
+        
+        # 2. 난이도 적합성 (25점)
+        difficulty_score = self._calculate_difficulty_score(user, template, user_habits)
+        score += difficulty_score * 0.25
+        
+        # 3. 시간 가용성 (20점)
+        time_score = self._calculate_time_compatibility_score(user, template)
+        score += time_score * 0.2
+        
+        # 4. 카테고리 균형 (15점)
+        balance_score = self._calculate_category_balance_score(template, user_habits)
+        score += balance_score * 0.15
+        
+        # 5. 인기도/추천도 (10점)
+        popularity_score = self._calculate_popularity_score(template)
+        score += popularity_score * 0.1
+        
+        return min(score, 100.0)  # 최대 100점
+
+    def _calculate_goal_alignment_score(self, user: User, template: HabitTemplate) -> float:
+        """사용자 목표와 습관의 일치도 점수"""
+        # 웰니스 프로필이 없으면 기본 점수
+        if not hasattr(user, 'wellness_profile') or not user.wellness_profile:
+            return 50.0
+        
+        # 사용자 목표와 습관 카테고리 매칭
+        user_goals = getattr(user.wellness_profile, 'primary_goals', [])
+        if not user_goals:
+            return 50.0
+        
+        # 카테고리별 목표 매핑 (간단한 예시)
+        category_goal_mapping = {
+            '운동': ['체중관리', '근력증진', '체력향상'],
+            '영양': ['체중관리', '건강관리', '에너지증진'],
+            '정신건강': ['스트레스관리', '수면개선', '집중력향상'],
+            '수면': ['수면개선', '스트레스관리'],
+            '생산성': ['집중력향상', '시간관리']
+        }
+        
+        category_name = template.category.name if template.category else ''
+        category_goals = category_goal_mapping.get(category_name, [])
+        
+        # 목표 일치 개수에 따른 점수
+        matches = len(set(user_goals) & set(category_goals))
+        if matches >= 2:
+            return 90.0
+        elif matches == 1:
+            return 70.0
+        else:
+            return 30.0
+
+    def _calculate_difficulty_score(
+        self, 
+        user: User, 
+        template: HabitTemplate, 
+        user_habits: List[UserHabit]
+    ) -> float:
+        """난이도 적합성 점수"""
+        # 사용자의 현재 습관 개수에 따른 적정 난이도
+        habit_count = len([h for h in user_habits if h.is_active])
+        
+        if habit_count == 0:  # 초보자
+            ideal_difficulty = DifficultyLevel.EASY
+        elif habit_count <= 3:  # 중급자
+            ideal_difficulty = DifficultyLevel.MODERATE
+        else:  # 고급자
+            ideal_difficulty = DifficultyLevel.HARD
+        
+        # 난이도 차이에 따른 점수
+        difficulty_diff = abs(template.difficulty_level.value - ideal_difficulty.value)
+        
+        if difficulty_diff == 0:
+            return 100.0
+        elif difficulty_diff == 1:
+            return 70.0
+        else:
+            return 40.0
+
+    def _calculate_time_compatibility_score(self, user: User, template: HabitTemplate) -> float:
+        """시간 가용성 점수"""
+        # 웰니스 프로필의 가용 시간대 정보 활용
+        if not hasattr(user, 'wellness_profile') or not user.wellness_profile:
+            return 60.0
+        
+        # 간단한 시간 호환성 계산 (실제로는 더 복잡한 로직 필요)
+        estimated_time = template.estimated_time_minutes
+        
+        if estimated_time <= 15:  # 15분 이하
+            return 90.0
+        elif estimated_time <= 30:  # 30분 이하
+            return 75.0
+        elif estimated_time <= 60:  # 1시간 이하
+            return 60.0
+        else:
+            return 40.0
+
+    def _calculate_category_balance_score(
+        self, 
+        template: HabitTemplate, 
+        user_habits: List[UserHabit]
+    ) -> float:
+        """카테고리 균형 점수 (다양성 장려)"""
+        if not user_habits:
+            return 80.0
+        
+        # 현재 사용자가 가진 카테고리들
+        existing_categories = {habit.habit_template.category_id for habit in user_habits}
+        
+        # 새로운 카테고리면 높은 점수
+        if template.category_id not in existing_categories:
+            return 90.0
+        else:
+            # 이미 있는 카테고리면 낮은 점수
+            return 40.0
+
+    def _calculate_popularity_score(self, template: HabitTemplate) -> float:
+        """인기도/추천도 점수"""
+        # 추천 템플릿이면 높은 점수
+        if template.is_featured:
+            return 90.0
+        
+        # 사용량에 따른 점수
+        usage_count = template.usage_count
+        if usage_count >= 100:
+            return 80.0
+        elif usage_count >= 50:
+            return 70.0
+        elif usage_count >= 10:
+            return 60.0
+        else:
+            return 50.0
+
+    def _diversify_recommendations(
+        self, 
+        scored_habits: List[Tuple[HabitTemplate, float]], 
+        limit: int
+    ) -> List[HabitTemplate]:
+        """추천 결과 다양성 보장"""
+        if len(scored_habits) <= limit:
+            return [habit for habit, _ in scored_habits]
+        
+        recommendations = []
+        used_categories = set()
+        
+        # 1차: 카테고리별로 최고 점수 1개씩
+        for habit, score in scored_habits:
+            if len(recommendations) >= limit:
+                break
+            
+            category_id = habit.category_id
+            if category_id not in used_categories:
+                recommendations.append(habit)
+                used_categories.add(category_id)
+        
+        # 2차: 남은 자리를 점수 순으로 채움
+        for habit, score in scored_habits:
+            if len(recommendations) >= limit:
+                break
+            
+            if habit not in recommendations:
+                recommendations.append(habit)
+        
+        return recommendations[:limit]
+
+    # =================================================================
+    # AI 코칭 메시지
+    # =================================================================
+
+    async def get_ai_coaching_message(
+        self, 
+        user_habit_id: UUID, 
+        context: str = "general"
+    ) -> Optional[str]:
+        """
+        습관별 AI 코칭 메시지 제공
+        
+        Args:
+            user_habit_id: 사용자 습관 ID
+            context: 메시지 컨텍스트 (general, motivation, tip, reminder)
+            
+        Returns:
+            Optional[str]: AI 코칭 메시지
+        """
+        # 사용자 습관 조회
+        stmt = select(UserHabit).options(
+            joinedload(UserHabit.habit_template)
+        ).where(UserHabit.id == user_habit_id)
+        
+        result = await self.db.execute(stmt)
+        user_habit = result.scalar_one_or_none()
+        
+        if not user_habit or not user_habit.habit_template:
+            return None
+        
+        # 템플릿의 AI 코칭 프롬프트에서 랜덤 선택
+        ai_prompts = user_habit.habit_template.ai_coaching_prompts
+        if not ai_prompts:
+            return self._get_default_coaching_message(context)
+        
+        # 컨텍스트별 필터링 (간단한 키워드 매칭)
+        context_prompts = []
+        for prompt in ai_prompts:
+            if context == "motivation" and any(word in prompt.lower() for word in ["동기", "격려", "화이팅", "할 수 있어"]):
+                context_prompts.append(prompt)
+            elif context == "tip" and any(word in prompt.lower() for word in ["팁", "방법", "어떻게", "효과적"]):
+                context_prompts.append(prompt)
+            elif context == "reminder" and any(word in prompt.lower() for word in ["시간", "잊지", "기억", "알림"]):
+                context_prompts.append(prompt)
+            else:
+                context_prompts.append(prompt)
+        
+        # 적절한 메시지가 없으면 전체에서 랜덤 선택
+        if not context_prompts:
+            context_prompts = ai_prompts
+        
+        return random.choice(context_prompts)
+
+    def _get_default_coaching_message(self, context: str) -> str:
+        """기본 코칭 메시지"""
+        default_messages = {
+            "general": [
+                "오늘도 좋은 습관을 실천해보세요! 💪",
+                "작은 변화가 큰 결과를 만듭니다! ✨",
+                "꾸준함이 가장 큰 힘입니다! 🌟"
+            ],
+            "motivation": [
+                "당신은 할 수 있습니다! 화이팅! 🔥",
+                "매일 조금씩 발전하고 있어요! 👏",
+                "포기하지 마세요, 거의 다 왔어요! 🎯"
+            ],
+            "tip": [
+                "작은 목표부터 시작해보세요! 📝",
+                "같은 시간에 하면 습관이 더 쉽게 만들어져요! ⏰",
+                "완벽하지 않아도 괜찮아요, 시작이 중요해요! 🌱"
+            ],
+            "reminder": [
+                "습관 실천 시간이에요! ⏰",
+                "오늘의 목표를 잊지 마세요! 📋",
+                "지금이 바로 그 시간입니다! ✨"
+            ]
+        }
+        
+        messages = default_messages.get(context, default_messages["general"])
+        return random.choice(messages)
+
+    # =================================================================
+    # 고급 통계 및 분석
+    # =================================================================
+
+    async def get_habit_statistics_summary(self, user_id: UUID) -> Dict[str, Any]:
+        """
+        사용자 습관 통계 요약
+        
+        Args:
+            user_id: 사용자 ID
+            
+        Returns:
+            Dict: 통계 요약 데이터
+        """
+        # 기본 통계
+        user_habits = await self.get_user_habits(user_id)
+        active_habits = [h for h in user_habits if h.is_active]
+        
+        # 전체 완료율 계산
+        total_completions = sum(h.total_completions for h in active_habits)
+        total_possible = len(active_habits) * 30  # 30일 기준
+        overall_completion_rate = (total_completions / total_possible * 100) if total_possible > 0 else 0
+        
+        # 최고 스트릭
+        best_streak = max((h.longest_streak for h in active_habits), default=0)
+        
+        # 현재 활성 스트릭
+        current_streaks = [h.current_streak for h in active_habits if h.current_streak > 0]
+        active_streaks_count = len(current_streaks)
+        
+        # 카테고리별 분포
+        category_stats = await self._get_category_distribution(user_id)
+        
+        # 주간 트렌드
+        weekly_trend = await self._get_weekly_completion_trend(user_id)
+        
+        # 시간대별 활동
+        time_distribution = await self._get_time_distribution(user_id)
+        
+        return {
+            "summary": {
+                "total_habits": len(user_habits),
+                "active_habits": len(active_habits),
+                "overall_completion_rate": round(overall_completion_rate, 1),
+                "total_completions": total_completions,
+                "best_streak": best_streak,
+                "active_streaks": active_streaks_count,
+                "total_points": sum(h.reward_points for h in active_habits)
+            },
+            "category_distribution": category_stats,
+            "weekly_trend": weekly_trend,
+            "time_distribution": time_distribution,
+            "insights": await self._generate_insights(user_id, active_habits)
+        }
+
+    async def _get_category_distribution(self, user_id: UUID) -> List[Dict[str, Any]]:
+        """카테고리별 습관 분포"""
+        stmt = select(
+            HabitCategory.name,
+            func.count(UserHabit.id).label('habit_count'),
+            func.avg(UserHabit.total_completions).label('avg_completions'),
+            func.sum(UserHabit.reward_points).label('total_points')
+        ).select_from(
+            UserHabit
+        ).join(
+            HabitTemplate, UserHabit.habit_template_id == HabitTemplate.id
+        ).join(
+            HabitCategory, HabitTemplate.category_id == HabitCategory.id
+        ).where(
+            and_(
+                UserHabit.user_id == user_id,
+                UserHabit.is_active == True
+            )
+        ).group_by(HabitCategory.name)
+        
+        result = await self.db.execute(stmt)
+        rows = result.fetchall()
+        
+        return [
+            {
+                "category": row.name,
+                "habit_count": row.habit_count,
+                "avg_completions": round(float(row.avg_completions or 0), 1),
+                "total_points": int(row.total_points or 0)
+            }
+            for row in rows
+        ]
+
+    async def _get_weekly_completion_trend(self, user_id: UUID) -> List[Dict[str, Any]]:
+        """주간 완료율 트렌드 (최근 4주)"""
+        end_date = datetime.now().date()
+        start_date = end_date - timedelta(weeks=4)
+        
+        weekly_data = []
+        current_date = start_date
+        
+        while current_date <= end_date:
+            week_end = min(current_date + timedelta(days=6), end_date)
+            
+            # 해당 주의 완료 로그 조회
+            stmt = select(
+                func.count(HabitLog.id).label('completions'),
+                func.count(func.distinct(HabitLog.user_habit_id)).label('active_habits')
+            ).select_from(
+                HabitLog
+            ).join(
+                UserHabit, HabitLog.user_habit_id == UserHabit.id
+            ).where(
+                and_(
+                    UserHabit.user_id == user_id,
+                    HabitLog.completion_status == CompletionStatus.COMPLETED,
+                    func.date(HabitLog.logged_at) >= current_date,
+                    func.date(HabitLog.logged_at) <= week_end
+                )
+            )
+            
+            result = await self.db.execute(stmt)
+            row = result.fetchone()
+            
+            weekly_data.append({
+                "week_start": current_date.isoformat(),
+                "week_end": week_end.isoformat(),
+                "completions": row.completions or 0,
+                "active_habits": row.active_habits or 0,
+                "completion_rate": round((row.completions or 0) / max((row.active_habits or 1) * 7, 1) * 100, 1)
+            })
+            
+            current_date = week_end + timedelta(days=1)
+        
+        return weekly_data
+
+    async def _get_time_distribution(self, user_id: UUID) -> Dict[str, int]:
+        """시간대별 습관 실행 분포"""
+        stmt = select(
+            func.extract('hour', HabitLog.logged_at).label('hour'),
+            func.count(HabitLog.id).label('count')
+        ).select_from(
+            HabitLog
+        ).join(
+            UserHabit, HabitLog.user_habit_id == UserHabit.id
+        ).where(
+            and_(
+                UserHabit.user_id == user_id,
+                HabitLog.completion_status == CompletionStatus.COMPLETED,
+                HabitLog.logged_at >= datetime.now() - timedelta(days=30)  # 최근 30일
+            )
+        ).group_by(
+            func.extract('hour', HabitLog.logged_at)
+        )
+        
+        result = await self.db.execute(stmt)
+        rows = result.fetchall()
+        
+        # 시간대별 분류
+        time_slots = {
+            "morning": 0,    # 6-12시
+            "afternoon": 0,  # 12-18시
+            "evening": 0,    # 18-22시
+            "night": 0       # 22-6시
+        }
+        
+        for row in rows:
+            hour = int(row.hour)
+            count = row.count
+            
+            if 6 <= hour < 12:
+                time_slots["morning"] += count
+            elif 12 <= hour < 18:
+                time_slots["afternoon"] += count
+            elif 18 <= hour < 22:
+                time_slots["evening"] += count
+            else:
+                time_slots["night"] += count
+        
+        return time_slots
+
+    async def _generate_insights(self, user_id: UUID, active_habits: List[UserHabit]) -> List[str]:
+        """AI 기반 인사이트 생성"""
+        insights = []
+        
+        if not active_habits:
+            insights.append("아직 활성 습관이 없습니다. 새로운 습관을 시작해보세요! 🌱")
+            return insights
+        
+        # 스트릭 관련 인사이트
+        best_habit = max(active_habits, key=lambda h: h.current_streak)
+        if best_habit.current_streak >= 7:
+            insights.append(f"🔥 '{best_habit.custom_name or best_habit.habit_template.name}' 습관이 {best_habit.current_streak}일 연속 달성 중입니다! 대단해요!")
+        
+        # 완료율 관련 인사이트
+        avg_completion_rate = sum(h.total_completions for h in active_habits) / len(active_habits)
+        if avg_completion_rate >= 20:
+            insights.append("💪 전반적으로 습관 실천을 잘 하고 계시네요! 꾸준함이 빛나고 있어요.")
+        elif avg_completion_rate < 5:
+            insights.append("🌱 습관 형성 초기 단계입니다. 작은 목표부터 차근차근 시작해보세요!")
+        
+        # 카테고리 다양성 인사이트
+        categories = set(h.habit_template.category_id for h in active_habits)
+        if len(categories) >= 3:
+            insights.append("🌈 다양한 영역의 습관을 균형있게 실천하고 계시네요!")
+        elif len(categories) == 1:
+            insights.append("💡 현재 한 분야에 집중하고 계시네요. 다른 영역의 습관도 고려해보세요!")
+        
+        # 포인트 관련 인사이트
+        total_points = sum(h.reward_points for h in active_habits)
+        if total_points >= 1000:
+            insights.append(f"🏆 총 {total_points}포인트를 획득하셨습니다! 정말 대단한 성과예요!")
+        
+        return insights[:3]  # 최대 3개 인사이트
