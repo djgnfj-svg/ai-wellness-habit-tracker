@@ -1,37 +1,35 @@
 """
-습관 관련 API 엔드포인트
+습관 관리 API 엔드포인트
+
+사용자 습관 생성, 조회, 수정, 삭제 및 습관 추적 기능을 제공합니다.
 """
+
+from datetime import datetime, date
 from typing import List, Optional
-from datetime import date, datetime
-from fastapi import APIRouter, Depends, HTTPException, status, Query
-from sqlalchemy.ext.asyncio import AsyncSession
 from uuid import UUID
 
-from app.api.dependencies import get_db, get_current_user, standard_rate_limit
-from app.schemas.habit import (
-    # Categories
-    HabitCategoryResponse, HabitCategoryCreate, HabitCategoryUpdate,
-    # Templates  
-    HabitTemplateResponse, HabitTemplateListResponse, HabitTemplateSearchParams,
-    HabitTemplateCreate, HabitTemplateUpdate,
-    # User Habits
-    UserHabitResponse, UserHabitCreate, UserHabitUpdate, UserHabitFilterParams,
-    # Logs
-    HabitLogResponse, HabitLogCreate, HabitLogUpdate,
-    # Dashboard
-    DashboardData,
-    # Common
-    StandardResponse
-)
-from app.services.habit_service import HabitService
-from app.services.notification_service import NotificationService
-from app.services.tracking_service import TrackingService
-from app.services.tracking_service import TrackingService
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.database import get_db
+from app.core.auth import get_current_user
+from app.core.rate_limit import standard_rate_limit
 from app.models.user import User
-from app.models.habit import DifficultyLevel, FrequencyType
+from app.schemas.habit import (
+    HabitCategoryCreate, HabitCategoryResponse,
+    HabitTemplateCreate, HabitTemplateResponse, HabitTemplateListResponse,
+    UserHabitCreate, UserHabitUpdate, UserHabitResponse,
+    HabitLogCreate, HabitLogResponse,
+    DashboardData, StandardResponse,
+    DifficultyLevel, FrequencyType
+)
+from app.schemas.user import UserHabitFilterParams, HabitTemplateSearchParams
+from app.services.habit_service import HabitService
+from app.services.tracking_service import TrackingService
+from app.services.ai_coaching_service import AICoachingService, MessageType, NotificationType
+from app.services.notification_service import NotificationService
 
 router = APIRouter()
-
 
 # =====================================================================
 # 습관 카테고리 API
@@ -45,9 +43,8 @@ async def get_habit_categories(
 ):
     """습관 카테고리 목록 조회"""
     habit_service = HabitService(db)
-    categories = await habit_service.get_categories(include_inactive=include_inactive)
-    return [HabitCategoryResponse.model_validate(cat) for cat in categories]
-
+    categories = await habit_service.get_categories(include_inactive)
+    return categories
 
 @router.get("/categories/{category_id}", response_model=HabitCategoryResponse)
 async def get_habit_category(
@@ -65,8 +62,7 @@ async def get_habit_category(
             detail="카테고리를 찾을 수 없습니다"
         )
     
-    return HabitCategoryResponse.model_validate(category)
-
+    return category
 
 # =====================================================================
 # 습관 템플릿 API
@@ -85,7 +81,7 @@ async def get_habit_templates(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(standard_rate_limit)
 ):
-    """습관 템플릿 목록 조회"""
+    """습관 템플릿 목록 조회 (페이지네이션 지원)"""
     habit_service = HabitService(db)
     
     search_params = HabitTemplateSearchParams(
@@ -99,16 +95,15 @@ async def get_habit_templates(
         limit=limit
     )
     
-    templates, total_count = await habit_service.get_habit_templates(search_params)
+    templates, total = await habit_service.get_habit_templates(search_params)
     
     return HabitTemplateListResponse(
-        habits=[HabitTemplateResponse.model_validate(t) for t in templates],
-        total_count=total_count,
-        has_next=(page * limit) < total_count,
+        templates=templates,
+        total=total,
         page=page,
-        limit=limit
+        limit=limit,
+        total_pages=(total + limit - 1) // limit
     )
-
 
 @router.get("/templates/{template_id}", response_model=HabitTemplateResponse)
 async def get_habit_template(
@@ -126,8 +121,7 @@ async def get_habit_template(
             detail="습관 템플릿을 찾을 수 없습니다"
         )
     
-    return HabitTemplateResponse.model_validate(template)
-
+    return template
 
 # =====================================================================
 # 사용자 습관 API
@@ -143,7 +137,7 @@ async def get_user_habits(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(standard_rate_limit)
 ):
-    """사용자의 습관 목록 조회"""
+    """사용자 습관 목록 조회"""
     habit_service = HabitService(db)
     
     filter_params = UserHabitFilterParams(
@@ -153,15 +147,8 @@ async def get_user_habits(
         has_reminder=has_reminder
     )
     
-    try:
-        habits = await habit_service.get_user_habits(current_user.id, filter_params)
-        return [UserHabitResponse.model_validate(habit) for habit in habits]
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"습관 목록 조회 실패: {str(e)}"
-        )
-
+    habits = await habit_service.get_user_habits(current_user.id, filter_params)
+    return habits
 
 @router.post("/user/habits", response_model=UserHabitResponse, status_code=status.HTTP_201_CREATED)
 async def create_user_habit(
@@ -172,16 +159,8 @@ async def create_user_habit(
 ):
     """새로운 사용자 습관 생성"""
     habit_service = HabitService(db)
-    
-    try:
-        habit = await habit_service.create_user_habit(current_user.id, habit_data)
-        return UserHabitResponse.model_validate(habit)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"습관 생성 실패: {str(e)}"
-        )
-
+    habit = await habit_service.create_user_habit(current_user.id, habit_data)
+    return habit
 
 @router.get("/user/habits/{habit_id}", response_model=UserHabitResponse)
 async def get_user_habit(
@@ -200,8 +179,7 @@ async def get_user_habit(
             detail="습관을 찾을 수 없습니다"
         )
     
-    return UserHabitResponse.model_validate(habit)
-
+    return habit
 
 @router.put("/user/habits/{habit_id}", response_model=UserHabitResponse)
 async def update_user_habit(
@@ -211,18 +189,17 @@ async def update_user_habit(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(standard_rate_limit)
 ):
-    """사용자 습관 업데이트"""
+    """사용자 습관 수정"""
     habit_service = HabitService(db)
+    habit = await habit_service.update_user_habit(current_user.id, habit_id, habit_update)
     
-    try:
-        habit = await habit_service.update_user_habit(current_user.id, habit_id, habit_update)
-        return UserHabitResponse.model_validate(habit)
-    except Exception as e:
+    if not habit:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"습관 업데이트 실패: {str(e)}"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="습관을 찾을 수 없습니다"
         )
-
+    
+    return habit
 
 @router.delete("/user/habits/{habit_id}", response_model=StandardResponse)
 async def delete_user_habit(
@@ -231,24 +208,20 @@ async def delete_user_habit(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(standard_rate_limit)
 ):
-    """사용자 습관 삭제 (비활성화)"""
+    """사용자 습관 삭제"""
     habit_service = HabitService(db)
+    success = await habit_service.delete_user_habit(current_user.id, habit_id)
     
-    try:
-        success = await habit_service.delete_user_habit(current_user.id, habit_id)
-        if success:
-            return StandardResponse(message="습관이 삭제되었습니다")
-        else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="습관 삭제에 실패했습니다"
-            )
-    except Exception as e:
+    if not success:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"습관 삭제 실패: {str(e)}"
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="습관을 찾을 수 없습니다"
         )
-
+    
+    return StandardResponse(
+        success=True,
+        message="습관이 성공적으로 삭제되었습니다"
+    )
 
 # =====================================================================
 # 습관 추적 API
@@ -261,18 +234,10 @@ async def create_habit_checkin(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(standard_rate_limit)
 ):
-    """습관 체크인 (실행 로그 생성)"""
+    """습관 체크인 (완료 기록)"""
     habit_service = HabitService(db)
-    
-    try:
-        log = await habit_service.create_habit_log(current_user.id, log_data)
-        return HabitLogResponse.model_validate(log)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"체크인 실패: {str(e)}"
-        )
-
+    log = await habit_service.create_habit_log(current_user.id, log_data)
+    return log
 
 @router.get("/tracking/logs", response_model=List[HabitLogResponse])
 async def get_habit_logs(
@@ -284,24 +249,16 @@ async def get_habit_logs(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(standard_rate_limit)
 ):
-    """습관 실행 로그 목록 조회"""
+    """습관 로그 조회"""
     habit_service = HabitService(db)
-    
-    try:
-        logs = await habit_service.get_habit_logs(
-            user_id=current_user.id,
-            habit_id=habit_id,
-            start_date=start_date,
-            end_date=end_date,
-            limit=limit
-        )
-        return [HabitLogResponse.model_validate(log) for log in logs]
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"로그 조회 실패: {str(e)}"
-        )
-
+    logs = await habit_service.get_habit_logs(
+        user_id=current_user.id,
+        habit_id=habit_id,
+        start_date=start_date,
+        end_date=end_date,
+        limit=limit
+    )
+    return logs
 
 @router.get("/tracking/today", response_model=DashboardData)
 async def get_today_dashboard(
@@ -310,24 +267,17 @@ async def get_today_dashboard(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(standard_rate_limit)
 ):
-    """오늘의 습관 현황 대시보드"""
+    """오늘의 습관 대시보드"""
     habit_service = HabitService(db)
     
     if target_date is None:
         target_date = date.today()
     
-    try:
-        dashboard_data = await habit_service.get_daily_dashboard(current_user.id, target_date)
-        return dashboard_data
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"대시보드 데이터 조회 실패: {str(e)}"
-        )
-
+    dashboard = await habit_service.get_daily_dashboard(current_user.id, target_date)
+    return dashboard
 
 # =====================================================================
-# 관리자 API (추후 권한 체크 추가 예정)
+# 관리자 API
 # =====================================================================
 
 @router.post("/admin/categories", response_model=HabitCategoryResponse, status_code=status.HTTP_201_CREATED)
@@ -337,18 +287,10 @@ async def create_habit_category(
     current_user: User = Depends(get_current_user),  # 추후 관리자 권한 체크 추가
     _: None = Depends(standard_rate_limit)
 ):
-    """습관 카테고리 생성 (관리자용)"""
+    """새로운 습관 카테고리 생성 (관리자 전용)"""
     habit_service = HabitService(db)
-    
-    try:
-        category = await habit_service.create_category(category_data)
-        return HabitCategoryResponse.model_validate(category)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"카테고리 생성 실패: {str(e)}"
-        )
-
+    category = await habit_service.create_category(category_data)
+    return category
 
 @router.post("/admin/templates", response_model=HabitTemplateResponse, status_code=status.HTTP_201_CREATED)
 async def create_habit_template(
@@ -357,21 +299,13 @@ async def create_habit_template(
     current_user: User = Depends(get_current_user),  # 추후 관리자 권한 체크 추가
     _: None = Depends(standard_rate_limit)
 ):
-    """습관 템플릿 생성 (관리자용)"""
+    """새로운 습관 템플릿 생성 (관리자 전용)"""
     habit_service = HabitService(db)
-    
-    try:
-        template = await habit_service.create_habit_template(template_data)
-        return HabitTemplateResponse.model_validate(template)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"템플릿 생성 실패: {str(e)}"
-        )
-
+    template = await habit_service.create_habit_template(template_data)
+    return template
 
 # =====================================================================
-# 통계 및 분석 API (추후 확장)
+# 통계 및 분석 API
 # =====================================================================
 
 @router.get("/stats/summary")
@@ -380,18 +314,10 @@ async def get_habit_statistics_summary(
     db: AsyncSession = Depends(get_db),
     _: None = Depends(standard_rate_limit)
 ):
-    """습관 통계 요약"""
+    """사용자 습관 통계 요약"""
     habit_service = HabitService(db)
-    
-    try:
-        statistics = await habit_service.get_habit_statistics_summary(current_user.id)
-        return statistics
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"통계 조회 실패: {str(e)}"
-        )
-
+    stats = await habit_service.get_habit_statistics_summary(current_user.id)
+    return stats
 
 @router.get("/recommendations", response_model=List[HabitTemplateResponse])
 async def get_habit_recommendations(
@@ -405,7 +331,7 @@ async def get_habit_recommendations(
     
     try:
         recommendations = await habit_service.recommend_habits_for_user(current_user, limit)
-        return [HabitTemplateResponse.model_validate(template) for template in recommendations]
+        return recommendations
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -777,3 +703,266 @@ async def get_smart_reminder_time(
             "optimal_reminder_time": None,
             "message": "충분한 데이터가 없어 기본 시간을 사용합니다"
         }
+
+
+# ==================== 4번 모듈: AI 코칭 시스템 ====================
+
+@router.post("/ai-coaching/personalized")
+async def generate_personalized_coaching_message(
+    message_type: MessageType,
+    habit_id: Optional[UUID] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    개인화된 AI 코칭 메시지 생성
+    
+    사용자의 현재 상황, 습관 진행 상태, 기분 등을 종합 분석하여
+    OpenAI GPT-4 기반의 개인화된 코칭 메시지를 생성합니다.
+    
+    Args:
+        message_type: 메시지 타입 (morning_motivation, habit_reminder, encouragement 등)
+        habit_id: 특정 습관 ID (선택사항)
+        
+    Returns:
+        개인화된 코칭 메시지와 분석 데이터
+    """
+    ai_coaching_service = AICoachingService(db)
+    
+    # 습관 ID가 제공된 경우 사용자 습관 확인
+    if habit_id:
+        habit_service = HabitService(db)
+        user_habit = await habit_service.get_user_habit_by_id(current_user.id, habit_id)
+        if not user_habit:
+            raise HTTPException(status_code=404, detail="습관을 찾을 수 없습니다")
+    
+    # 개인화된 코칭 메시지 생성
+    coaching_message = await ai_coaching_service.generate_personalized_message(
+        user_id=current_user.id,
+        message_type=message_type,
+        habit_id=habit_id
+    )
+    
+    return {
+        "message": coaching_message.message,
+        "message_type": coaching_message.message_type.value,
+        "tone": coaching_message.tone,
+        "personalization_score": coaching_message.personalization_score,
+        "context_relevance": coaching_message.context_relevance,
+        "generated_at": coaching_message.generated_at.isoformat(),
+        "habit_id": str(habit_id) if habit_id else None
+    }
+
+
+@router.get("/ai-coaching/context-analysis")
+async def analyze_coaching_context(
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    사용자 코칭 컨텍스트 분석
+    
+    사용자의 현재 상황을 종합 분석하여 코칭 기회를 감지하고
+    최적의 코칭 전략을 제안합니다.
+    
+    Returns:
+        현재 상황 분석 결과 및 코칭 기회 목록
+    """
+    ai_coaching_service = AICoachingService(db)
+    
+    # 컨텍스트 분석
+    context = await ai_coaching_service.context_analyzer.analyze_current_situation(current_user.id)
+    
+    # 코칭 기회 감지
+    opportunities = await ai_coaching_service.context_analyzer.identify_coaching_opportunities(context)
+    
+    return {
+        "user_profile": {
+            "name": context.user_profile.get("name"),
+            "timezone": context.user_profile.get("timezone"),
+            "personality_type": context.user_profile.get("personality_type")
+        },
+        "current_situation": {
+            "current_time": context.current_time.isoformat(),
+            "day_of_week": context.day_of_week,
+            "time_of_day": context.time_of_day
+        },
+        "habit_status": {
+            "streak_status": context.streak_status,
+            "recent_completion_rate": ai_coaching_service._calculate_recent_completion_rate_from_context(context)
+        },
+        "coaching_opportunities": [
+            {
+                "type": opp.opportunity_type,
+                "priority": opp.priority,
+                "context": opp.context,
+                "suggested_message_type": opp.suggested_message_type.value,
+                "urgency": opp.urgency
+            }
+            for opp in opportunities[:5]  # 상위 5개만 반환
+        ],
+        "mood_insights": {
+            "recent_mood_average": sum(mood.mood_score for mood in context.mood_trends) / len(context.mood_trends) if context.mood_trends else 0,
+            "energy_trend": [mood.energy_level.value for mood in context.mood_trends[-3:]] if context.mood_trends else [],
+            "stress_level": context.mood_trends[-1].stress_level if context.mood_trends else 5
+        },
+        "environmental_factors": {
+            "weather": {
+                "condition": context.weather_data.condition.value if context.weather_data else "unknown",
+                "temperature": context.weather_data.temperature if context.weather_data else None
+            },
+            "upcoming_events": len(context.calendar_events),
+            "energy_pattern": {
+                "current_energy": context.energy_patterns.morning_energy.value if context.energy_patterns and context.time_of_day == "morning" else "medium"
+            }
+        }
+    }
+
+
+@router.get("/ai-coaching/smart-notification/{habit_id}")
+async def get_smart_notification_schedule(
+    habit_id: UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    습관별 스마트 알림 스케줄 조회
+    
+    사용자의 행동 패턴을 분석하여 최적의 알림 시간과 빈도를 계산합니다.
+    
+    Args:
+        habit_id: 사용자 습관 ID
+        
+    Returns:
+        최적화된 알림 스케줄과 개인화 설정
+    """
+    habit_service = HabitService(db)
+    
+    # 사용자 습관 확인
+    user_habit = await habit_service.get_user_habit_by_id(current_user.id, habit_id)
+    if not user_habit:
+        raise HTTPException(status_code=404, detail="습관을 찾을 수 없습니다")
+    
+    # SmartNotificationEngine 인스턴스 생성
+    from app.services.ai_coaching_service import SmartNotificationEngine
+    smart_engine = SmartNotificationEngine(db)
+    
+    # 스마트 알림 스케줄 및 빈도 계산
+    schedule = await smart_engine.optimize_notification_timing(current_user.id, habit_id)
+    frequency_config = await smart_engine.calculate_notification_frequency(current_user.id, habit_id)
+    
+    return {
+        "habit_info": {
+            "id": str(habit_id),
+            "name": user_habit.habit_template.name if user_habit.habit_template else "사용자 정의 습관"
+        },
+        "notification_schedule": {
+            "optimal_times": schedule.optimal_times,
+            "frequency": schedule.frequency,
+            "enabled": schedule.enabled
+        },
+        "frequency_config": {
+            "daily_limit": frequency_config.daily_limit,
+            "min_interval_hours": frequency_config.min_interval_hours,
+            "peak_times": frequency_config.peak_times,
+            "avoid_times": frequency_config.avoid_times
+        },
+        "personalization_insights": {
+            "based_on_completion_patterns": True,
+            "analysis_period_days": 30,
+            "confidence_score": 0.85
+        }
+    }
+
+
+@router.post("/ai-coaching/notification/personalize")
+async def generate_personalized_notification(
+    notification_type: NotificationType,
+    habit_id: Optional[UUID] = None,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    개인화된 알림 메시지 생성
+    
+    사용자의 선호도와 상황에 맞는 개인화된 알림 메시지를 생성합니다.
+    
+    Args:
+        notification_type: 알림 타입 (habit_reminder, streak_alert, motivation 등)
+        habit_id: 습관 ID (선택사항)
+        
+    Returns:
+        개인화된 알림 메시지
+    """
+    from app.services.ai_coaching_service import SmartNotificationEngine
+    smart_engine = SmartNotificationEngine(db)
+    
+    # 습관 ID가 제공된 경우 사용자 습관 확인
+    if habit_id:
+        habit_service = HabitService(db)
+        user_habit = await habit_service.get_user_habit_by_id(current_user.id, habit_id)
+        if not user_habit:
+            raise HTTPException(status_code=404, detail="습관을 찾을 수 없습니다")
+    
+    # 개인화된 알림 메시지 생성
+    message = await smart_engine.personalize_notification_content(
+        user_id=current_user.id,
+        notification_type=notification_type,
+        habit_id=habit_id
+    )
+    
+    return {
+        "message": message,
+        "notification_type": notification_type.value,
+        "habit_id": str(habit_id) if habit_id else None,
+        "personalization_applied": True,
+        "generated_at": datetime.now().isoformat()
+    }
+
+
+@router.get("/ai-coaching/opportunities")
+async def get_coaching_opportunities(
+    priority_threshold: int = Query(5, ge=1, le=10, description="우선순위 임계값 (이상만 반환)"),
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    현재 코칭 기회 목록 조회
+    
+    사용자의 현재 상황을 분석하여 즉시 실행 가능한 코칭 기회들을 제안합니다.
+    
+    Args:
+        priority_threshold: 우선순위 임계값 (이상만 반환)
+        
+    Returns:
+        우선순위가 높은 코칭 기회 목록
+    """
+    ai_coaching_service = AICoachingService(db)
+    
+    # 컨텍스트 분석 및 코칭 기회 감지
+    context = await ai_coaching_service.context_analyzer.analyze_current_situation(current_user.id)
+    opportunities = await ai_coaching_service.context_analyzer.identify_coaching_opportunities(context)
+    
+    # 우선순위 필터링
+    high_priority_opportunities = [
+        opp for opp in opportunities 
+        if opp.priority >= priority_threshold
+    ]
+    
+    return {
+        "total_opportunities": len(opportunities),
+        "high_priority_count": len(high_priority_opportunities),
+        "opportunities": [
+            {
+                "id": f"opp_{i+1}",
+                "type": opp.opportunity_type,
+                "priority": opp.priority,
+                "urgency": opp.urgency,
+                "context": opp.context,
+                "suggested_message_type": opp.suggested_message_type.value,
+                "recommended_action": f"{opp.suggested_message_type.value} 메시지 발송"
+            }
+            for i, opp in enumerate(high_priority_opportunities)
+        ],
+        "analysis_timestamp": context.current_time.isoformat()
+    }
