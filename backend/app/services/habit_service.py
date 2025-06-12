@@ -1201,3 +1201,15 @@ class HabitService:
             insights.append(f"🏆 총 {total_points}포인트를 획득하셨습니다! 정말 대단한 성과예요!")
         
         return insights[:3]  # 최대 3개 인사이트
+
+    async def get_habit_log(self, log_id: UUID) -> Optional[HabitLog]:
+        """습관 로그 조회"""
+        stmt = select(HabitLog).where(HabitLog.id == log_id)
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
+
+    async def get_user_habit_by_log(self, log_id: UUID) -> Optional[UserHabit]:
+        """로그 ID로 사용자 습관 조회"""
+        stmt = select(UserHabit).join(HabitLog).where(HabitLog.id == log_id)
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
