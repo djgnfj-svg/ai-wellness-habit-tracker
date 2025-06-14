@@ -5,6 +5,8 @@ import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { StatusBar } from 'expo-status-bar';
 import { View, Text } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { Provider } from 'react-redux';
+import { store } from './src/store';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // Import screens
@@ -94,8 +96,8 @@ function MainTabNavigator() {
   );
 }
 
-// Main App Component
-export default function App() {
+// Main App Navigator
+function AppNavigator() {
   const [isFirstLaunch, setIsFirstLaunch] = useState<boolean | null>(null);
   const [isLoggedIn, setIsLoggedIn] = useState<boolean | null>(null);
 
@@ -120,9 +122,26 @@ export default function App() {
   // Show loading screen while checking status
   if (isFirstLaunch === null || isLoggedIn === null) {
     return (
-      <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: '#34C759' }}>
-        <Text style={{ color: 'white', fontSize: 24, fontWeight: 'bold' }}>WellnessAI</Text>
-        <Text style={{ color: 'white', fontSize: 16, marginTop: 10 }}>로딩 중...</Text>
+      <View style={{ 
+        flex: 1, 
+        justifyContent: 'center', 
+        alignItems: 'center', 
+        backgroundColor: '#34C759' 
+      }}>
+        <Text style={{ 
+          color: 'white', 
+          fontSize: 24, 
+          fontWeight: 'bold' 
+        }}>
+          WellnessAI
+        </Text>
+        <Text style={{ 
+          color: 'white', 
+          fontSize: 16, 
+          marginTop: 10 
+        }}>
+          로딩 중...
+        </Text>
       </View>
     );
   }
@@ -146,5 +165,14 @@ export default function App() {
         <Stack.Screen name="Main" component={MainTabNavigator} />
       </Stack.Navigator>
     </NavigationContainer>
+  );
+}
+
+// Main App Component with Redux Provider
+export default function App() {
+  return (
+    <Provider store={store}>
+      <AppNavigator />
+    </Provider>
   );
 }
